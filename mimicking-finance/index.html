@@ -1,0 +1,603 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>LSTM Model Construction — Cohen, Lu &amp; Nguyen (2026)</title>
+  <meta name="description" content="Interactive visualization of the LSTM model architecture from 'Mimicking Finance' by Cohen, Lu, and Nguyen (2026)." />
+  <link href="https://fonts.googleapis.com/css2?family=Open+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet" />
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #0a0f1a; }
+    ::-webkit-scrollbar { height: 6px; width: 6px; }
+    ::-webkit-scrollbar-track { background: #111827; }
+    ::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState } = React;
+
+    const STEPS = [
+      {
+        id: "raw",
+        label: "1. Raw Holdings Data",
+        subtitle: "Fund-Security-Quarter Panel",
+        description:
+          "Start with quarterly holdings: for each fund, every security held and its share count. This is sourced from SEC filings (N-PORT, N-CSR, N-Q). Each row is one fund holding one stock in one quarter.",
+        visual: "raw",
+      },
+      {
+        id: "rank",
+        label: "2. Rank & Pad",
+        subtitle: "Fixed-Width Cross-Section",
+        description:
+          "Within each fund-quarter, rank all holdings by market value (rank 1 = largest). Pad to a fixed width N (the max number of holdings in that fund's rolling window). Padded slots get zeros and a mask flag.",
+        visual: "rank",
+      },
+      {
+        id: "features",
+        label: "3. Feature Engineering",
+        subtitle: "F Features Per Security",
+        description:
+          "For each security slot, compute F features: lagged shares (6 quarters), portfolio weight dynamics, within-fund rank, log market cap, B/M, momentum, factor exposures, peer category behavior rates, macro variables, and a padding indicator.",
+        visual: "features",
+      },
+      {
+        id: "tensor",
+        label: "4. 3D Tensor",
+        subtitle: "X ∈ ℝ^(T×N×F)",
+        description:
+          "Stack 8 consecutive quarters to form a 3D tensor. T=8 time steps, N securities (padded), F features each. This is the raw representation of one fund's portfolio evolving over 2 years.",
+        visual: "tensor",
+      },
+      {
+        id: "vectorize",
+        label: "5. Vectorize Cross-Section",
+        subtitle: "Flatten N×F → NF per time step",
+        description:
+          "At each time step, concatenate the N×F feature matrix into a single NF-dimensional vector. The resulting sequence (x₁, ..., x₈) ∈ ℝ^(T×NF) is the LSTM input. This preserves cross-sectional structure in a fixed-width format.",
+        visual: "vectorize",
+      },
+      {
+        id: "lstm",
+        label: "6. Single-Layer LSTM",
+        subtitle: "Hidden dim scales with N",
+        description:
+          "Feed the sequence through a single-layer LSTM. The hidden dimension scales with cross-section size N. Dropout and recurrent dropout both at 0.25. The LSTM processes 8 time steps sequentially, building up memory of how the portfolio evolved.",
+        visual: "lstm",
+      },
+      {
+        id: "masks",
+        label: "7. Feasibility Masks",
+        subtitle: "Time-Step + Output Masks",
+        description:
+          "Two masks enforce domain constraints. Time-step mask: skip quarters where all securities are padding. Output mask: for any security not held continuously, zero out the sell probability and renormalize over {hold, buy}. You can't sell what you don't own.",
+        visual: "masks",
+      },
+      {
+        id: "output",
+        label: "8. Output Grid",
+        subtitle: "(N × 3) Probability Grid",
+        description:
+          "The LSTM output passes through a dense layer, is reshaped to (N × 3), and softmaxed per security. Each security gets P(sell), P(hold), P(buy). The argmax gives the predicted trade direction. This is evaluated against the actual next-quarter trade.",
+        visual: "output",
+      },
+    ];
+
+    const COLORS = {
+      bg: "#0a0f1a",
+      card: "#111827",
+      border: "#1e293b",
+      text: "#e2e8f0",
+      textMuted: "#94a3b8",
+      textDim: "#64748b",
+      accent: "#3b82f6",
+      accentLight: "#60a5fa",
+      sell: "#ef4444",
+      sellBg: "rgba(239,68,68,0.15)",
+      hold: "#f59e0b",
+      holdBg: "rgba(245,158,11,0.15)",
+      buy: "#22c55e",
+      buyBg: "rgba(34,197,94,0.15)",
+      purple: "#a78bfa",
+      purpleBg: "rgba(167,139,250,0.12)",
+      cyan: "#22d3ee",
+      cyanBg: "rgba(34,211,238,0.1)",
+      mask: "#f43f5e",
+      maskBg: "rgba(244,63,94,0.15)",
+    };
+
+    function RawDataVisual() {
+      const rows = [
+        { fund: "Fund A", ticker: "AAPL", quarter: "Q1", shares: "50,000", mv: "$8.7M" },
+        { fund: "Fund A", ticker: "MSFT", quarter: "Q1", shares: "30,000", mv: "$11.2M" },
+        { fund: "Fund A", ticker: "GOOGL", quarter: "Q1", shares: "15,000", mv: "$2.1M" },
+        { fund: "Fund A", ticker: "AAPL", quarter: "Q2", shares: "55,000", mv: "$9.9M" },
+        { fund: "Fund A", ticker: "MSFT", quarter: "Q2", shares: "28,000", mv: "$10.8M" },
+        { fund: "Fund A", ticker: "NVDA", quarter: "Q2", shares: "20,000", mv: "$5.4M" },
+      ];
+      return (
+        React.createElement("div", { style: { overflowX: "auto" } },
+          React.createElement("table", { style: { width: "100%", borderCollapse: "collapse", fontSize: 13, fontFamily: "'JetBrains Mono', monospace" } },
+            React.createElement("thead", null,
+              React.createElement("tr", null,
+                ["Fund", "Ticker", "Quarter", "Shares", "Mkt Value"].map((h) =>
+                  React.createElement("th", { key: h, style: { padding: "8px 12px", textAlign: "left", color: COLORS.textMuted, borderBottom: "1px solid " + COLORS.border, fontWeight: 500, fontSize: 11, textTransform: "uppercase", letterSpacing: 1 } }, h)
+                )
+              )
+            ),
+            React.createElement("tbody", null,
+              rows.map((r, i) =>
+                React.createElement("tr", { key: i, style: { borderBottom: "1px solid " + COLORS.border } },
+                  React.createElement("td", { style: { padding: "7px 12px", color: COLORS.accent } }, r.fund),
+                  React.createElement("td", { style: { padding: "7px 12px", color: COLORS.text, fontWeight: 600 } }, r.ticker),
+                  React.createElement("td", { style: { padding: "7px 12px", color: COLORS.textMuted } }, r.quarter),
+                  React.createElement("td", { style: { padding: "7px 12px", color: COLORS.text } }, r.shares),
+                  React.createElement("td", { style: { padding: "7px 12px", color: COLORS.text } }, r.mv)
+                )
+              )
+            )
+          ),
+          React.createElement("div", { style: { marginTop: 10, fontSize: 11, color: COLORS.textDim, fontStyle: "italic" } },
+            "~5.4M fund-security-quarter observations across 1,706 funds (1990–2023)"
+          )
+        )
+      );
+    }
+
+    function RankPadVisual() {
+      const securities = [
+        { rank: 1, ticker: "MSFT", mv: "$11.2M", real: true },
+        { rank: 2, ticker: "AAPL", mv: "$9.9M", real: true },
+        { rank: 3, ticker: "NVDA", mv: "$5.4M", real: true },
+        { rank: 4, ticker: "AMZN", mv: "$3.1M", real: true },
+        { rank: 5, ticker: "—", mv: "—", real: false },
+        { rank: 6, ticker: "—", mv: "—", real: false },
+      ];
+      return (
+        <div>
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 12 }}>
+            {securities.map((s) => (
+              <div key={s.rank} style={{
+                padding: "10px 14px", borderRadius: 8, minWidth: 80,
+                background: s.real ? COLORS.purpleBg : "rgba(100,116,139,0.08)",
+                border: "1px solid " + (s.real ? "rgba(167,139,250,0.25)" : "rgba(100,116,139,0.15)"),
+                opacity: s.real ? 1 : 0.45,
+              }}>
+                <div style={{ fontSize: 10, color: COLORS.textDim, marginBottom: 2 }}>Rank {s.rank}</div>
+                <div style={{ fontSize: 14, fontWeight: 700, color: s.real ? COLORS.purple : COLORS.textDim, fontFamily: "'JetBrains Mono', monospace" }}>{s.ticker}</div>
+                <div style={{ fontSize: 11, color: COLORS.textMuted, marginTop: 2 }}>{s.mv}</div>
+              </div>
+            ))}
+          </div>
+          <div style={{ display: "flex", gap: 16, fontSize: 12 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              <div style={{ width: 10, height: 10, borderRadius: 2, background: COLORS.purple }} />
+              <span style={{ color: COLORS.textMuted }}>Real holding</span>
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              <div style={{ width: 10, height: 10, borderRadius: 2, background: COLORS.textDim, opacity: 0.4 }} />
+              <span style={{ color: COLORS.textMuted }}>Padded (mask=1)</span>
+            </div>
+          </div>
+          <div style={{ marginTop: 10, fontSize: 11, color: COLORS.textDim, fontStyle: "italic" }}>
+            N = max holdings across the fund's 28-quarter rolling window
+          </div>
+        </div>
+      );
+    }
+
+    function FeatureVisual() {
+      const categories = [
+        { name: "Position Context", features: ["sh_lag1…sh_lag6", "weight_curr", "weight_Δ", "rank_in_fund", "padding_mask"], color: COLORS.purple },
+        { name: "Security Fundamentals", features: ["log(mkt_cap)", "B/M ratio", "momentum_1m…12m", "earnings_surprise"], color: COLORS.accent },
+        { name: "Factor Exposures", features: ["Mkt-RF β", "SMB β", "HML β", "RMW β", "CMA β", "ST_Rev β"], color: COLORS.cyan },
+        { name: "Peer Category", features: ["pct_buying", "pct_selling", "pct_holding", "lagged_rates"], color: "#f59e0b" },
+        { name: "Macro", features: ["yield_curve_level", "yield_curve_slope", "BAA_spread", "term_spreads"], color: COLORS.sell },
+      ];
+      return (
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          {categories.map((cat) => (
+            <div key={cat.name} style={{ display: "flex", alignItems: "flex-start", gap: 10 }}>
+              <div style={{ minWidth: 130, fontSize: 11, fontWeight: 600, color: cat.color, padding: "4px 0", whiteSpace: "nowrap" }}>{cat.name}</div>
+              <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+                {cat.features.map((f) => (
+                  <span key={f} style={{
+                    fontSize: 10, padding: "3px 7px", borderRadius: 4,
+                    background: cat.color + "18", border: "1px solid " + cat.color + "30",
+                    color: COLORS.textMuted, fontFamily: "'JetBrains Mono', monospace",
+                  }}>{f}</span>
+                ))}
+              </div>
+            </div>
+          ))}
+          <div style={{ marginTop: 6, fontSize: 11, color: COLORS.textDim, fontStyle: "italic" }}>
+            All features lagged — observable at prediction time. No future information.
+          </div>
+        </div>
+      );
+    }
+
+    function TensorVisual() {
+      const T = 8, N = 6;
+      return (
+        <div>
+          <svg viewBox="0 0 440 220" style={{ width: "100%", maxWidth: 440 }}>
+            <rect x="80" y="10" width={N * 30} height={T * 20} rx="3" fill="none" stroke={COLORS.cyan} strokeWidth="1" opacity="0.2" />
+            <rect x="60" y="25" width={N * 30} height={T * 20} rx="3" fill="none" stroke={COLORS.accent} strokeWidth="1" opacity="0.3" />
+            <rect x="40" y="40" width={N * 30} height={T * 20} rx="3" fill={COLORS.purpleBg} stroke={COLORS.purple} strokeWidth="1.5" />
+            {Array.from({ length: T - 1 }).map((_, i) => (
+              <line key={"h" + i} x1="40" y1={40 + (i + 1) * 20} x2={40 + N * 30} y2={40 + (i + 1) * 20} stroke={COLORS.purple} strokeWidth="0.3" opacity="0.4" />
+            ))}
+            {Array.from({ length: N - 1 }).map((_, i) => (
+              <line key={"v" + i} x1={40 + (i + 1) * 30} y1="40" x2={40 + (i + 1) * 30} y2={40 + T * 20} stroke={COLORS.purple} strokeWidth="0.3" opacity="0.4" />
+            ))}
+            <text x="20" y={40 + T * 10} fill={COLORS.textMuted} fontSize="11" textAnchor="middle" transform={"rotate(-90, 20, " + (40 + T * 10) + ")"}>T = 8 quarters</text>
+            <text x={40 + N * 15} y={40 + T * 20 + 18} fill={COLORS.textMuted} fontSize="11" textAnchor="middle">N securities</text>
+            <line x1={40 + N * 30 + 5} y1="40" x2={80 + N * 30 + 5} y2="10" stroke={COLORS.cyan} strokeWidth="1" opacity="0.5" />
+            <text x={80 + N * 30 + 12} y="14" fill={COLORS.cyan} fontSize="11" opacity="0.8">F features</text>
+            {["Q1'03", "Q2'03", "Q3'03", "Q4'03", "Q1'04", "Q2'04", "Q3'04", "Q4'04"].map((q, i) => (
+              <text key={q} x="38" y={40 + i * 20 + 14} fill={COLORS.textDim} fontSize="8" textAnchor="end" fontFamily="'JetBrains Mono', monospace">{q}</text>
+            ))}
+            {["#1", "#2", "#3", "#4", "#5", "#6"].map((s, i) => (
+              <text key={s} x={40 + i * 30 + 15} y="37" fill={COLORS.textDim} fontSize="8" textAnchor="middle" fontFamily="'JetBrains Mono', monospace">{s}</text>
+            ))}
+            <text x="310" y="80" fill={COLORS.text} fontSize="13" fontWeight="700">X ∈ ℝ ^(T×N×F)</text>
+            <text x="310" y="105" fill={COLORS.textMuted} fontSize="10">One fund,</text>
+            <text x="310" y="120" fill={COLORS.textMuted} fontSize="10">one rolling window</text>
+          </svg>
+        </div>
+      );
+    }
+
+    function VectorizeVisual() {
+      return (
+        <div>
+          <svg viewBox="0 0 460 180" style={{ width: "100%", maxWidth: 460 }}>
+            <text x="10" y="15" fill={COLORS.textMuted} fontSize="10">One time step t:</text>
+            <text x="10" y="28" fill={COLORS.textDim} fontSize="9">N × F matrix</text>
+            {Array.from({ length: 4 }).map((_, row) =>
+              Array.from({ length: 5 }).map((_, col) => (
+                <rect key={row + "-" + col} x={10 + col * 28} y={38 + row * 22} width="26" height="20" rx="2"
+                  fill={row < 3 ? COLORS.purpleBg : "rgba(100,116,139,0.06)"}
+                  stroke={row < 3 ? "rgba(167,139,250,0.25)" : "rgba(100,116,139,0.12)"} strokeWidth="1" />
+              ))
+            )}
+            {["Sec 1", "Sec 2", "Sec 3", "Pad"].map((s, i) => (
+              <text key={s} x="4" y={38 + i * 22 + 14} fill={i < 3 ? COLORS.textMuted : COLORS.textDim} fontSize="7" textAnchor="end" opacity={i < 3 ? 1 : 0.5}>{s}</text>
+            ))}
+            {["₁", "₂", "₃", "₄", "₅"].map((f, i) => (
+              <text key={"f" + i} x={10 + i * 28 + 13} y="36" fill={COLORS.textDim} fontSize="8" textAnchor="middle">f{f}</text>
+            ))}
+            <line x1="165" y1="80" x2="200" y2="80" stroke={COLORS.accent} strokeWidth="1.5" />
+            <polygon points="200,76 208,80 200,84" fill={COLORS.accent} />
+            <text x="186" y="72" fill={COLORS.textMuted} fontSize="9" textAnchor="middle">flatten</text>
+            <text x="220" y="15" fill={COLORS.textMuted} fontSize="10">NF-dimensional vector:</text>
+            {Array.from({ length: 20 }).map((_, i) => {
+              const isReal = i < 15;
+              return (
+                <rect key={i} x={220 + i * 11} y="38" width="10" height="44" rx="1"
+                  fill={isReal ? COLORS.purpleBg : "rgba(100,116,139,0.06)"}
+                  stroke={isReal ? "rgba(167,139,250,0.2)" : "rgba(100,116,139,0.1)"} strokeWidth="0.5" />
+              );
+            })}
+            <text x="220" y="96" fill={COLORS.textDim} fontSize="8">sec1_f1 sec1_f2 ... sec1_fF sec2_f1 ... secN_fF</text>
+            <text x="220" y="125" fill={COLORS.accent} fontSize="11" fontWeight="600">× 8 time steps</text>
+            <text x="220" y="140" fill={COLORS.textMuted} fontSize="10">→ sequence (x₁, ..., x₈) ∈ ℝ</text>
+            <text x="412" y="133" fill={COLORS.accent} fontSize="8">T × NF</text>
+          </svg>
+        </div>
+      );
+    }
+
+    function LSTMVisual() {
+      const steps = ["Q1", "Q2", "Q3", "Q4", "Q5", "Q6", "Q7", "Q8"];
+      return (
+        <div>
+          <svg viewBox="0 0 460 200" style={{ width: "100%", maxWidth: 460 }}>
+            {steps.map((q, i) => {
+              const x = 20 + i * 54;
+              const isMasked = i === 0;
+              return (
+                <g key={q}>
+                  <rect x={x} y="140" width="44" height="22" rx="3"
+                    fill={isMasked ? COLORS.maskBg : COLORS.purpleBg}
+                    stroke={isMasked ? COLORS.mask : "rgba(167,139,250,0.3)"}
+                    strokeWidth="1" strokeDasharray={isMasked ? "3,2" : "none"} />
+                  <text x={x + 22} y="155" fill={isMasked ? COLORS.mask : COLORS.textMuted}
+                    fontSize="8" textAnchor="middle" fontFamily="'JetBrains Mono', monospace">
+                    {isMasked ? "masked" : "x_" + (i + 1)}
+                  </text>
+                  {!isMasked && (
+                    <line x1={x + 22} y1="138" x2={x + 22} y2="112" stroke={COLORS.textDim} strokeWidth="1" />
+                  )}
+                  <rect x={x} y="78" width="44" height="32" rx="5"
+                    fill={isMasked ? "rgba(100,116,139,0.05)" : COLORS.cyanBg}
+                    stroke={isMasked ? "rgba(100,116,139,0.15)" : "rgba(34,211,238,0.3)"}
+                    strokeWidth="1.5" opacity={isMasked ? 0.3 : 1} />
+                  <text x={x + 22} y="98" fill={isMasked ? COLORS.textDim : COLORS.cyan}
+                    fontSize="9" textAnchor="middle" fontWeight="600" opacity={isMasked ? 0.3 : 1}>LSTM</text>
+                  {i < steps.length - 1 && !isMasked && (
+                    <g>
+                      <line x1={x + 44} y1="94" x2={x + 54} y2="94" stroke={COLORS.cyan} strokeWidth="1" opacity="0.5" />
+                      <text x={x + 49} y="88" fill={COLORS.textDim} fontSize="7" textAnchor="middle">h</text>
+                    </g>
+                  )}
+                  {i < steps.length - 1 && !isMasked && (
+                    <line x1={x + 44} y1="82" x2={x + 54} y2="82" stroke={COLORS.accentLight} strokeWidth="1" opacity="0.3" />
+                  )}
+                </g>
+              );
+            })}
+            <line x1={20 + 7 * 54 + 22} y1="78" x2={20 + 7 * 54 + 22} y2="50" stroke={COLORS.cyan} strokeWidth="1.5" />
+            <polygon points={(20 + 7 * 54 + 18) + ",50 " + (20 + 7 * 54 + 22) + ",42 " + (20 + 7 * 54 + 26) + ",50"} fill={COLORS.cyan} />
+            <rect x={20 + 7 * 54 - 10} y="16" width="64" height="24" rx="4"
+              fill="rgba(34,197,94,0.1)" stroke="rgba(34,197,94,0.3)" strokeWidth="1" />
+            <text x={20 + 7 * 54 + 22} y="32" fill={COLORS.buy} fontSize="9" textAnchor="middle" fontWeight="600">
+              Dense → N×3
+            </text>
+            <text x="10" y="172" fill={COLORS.textDim} fontSize="9">Inputs:</text>
+            <text x="10" y="100" fill={COLORS.textDim} fontSize="9">Cells:</text>
+            <text x={20 + 7 * 54 + 50} y="32" fill={COLORS.textMuted} fontSize="9">softmax</text>
+          </svg>
+          <div style={{ display: "flex", gap: 16, fontSize: 11, marginTop: 4 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+              <div style={{ width: 14, height: 8, borderRadius: 2, background: COLORS.maskBg, border: "1px dashed " + COLORS.mask }} />
+              <span style={{ color: COLORS.textMuted }}>Time-step mask (all padding → skip)</span>
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+              <div style={{ width: 14, height: 8, borderRadius: 2, background: COLORS.cyanBg, border: "1px solid rgba(34,211,238,0.3)" }} />
+              <span style={{ color: COLORS.textMuted }}>Active LSTM cell</span>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    function MasksVisual() {
+      const securities = [
+        { ticker: "MSFT", held: [1,1,1,1,1,1,1,1], canSell: true },
+        { ticker: "AAPL", held: [1,1,1,1,1,1,1,1], canSell: true },
+        { ticker: "NVDA", held: [0,0,0,1,1,1,1,1], canSell: false },
+        { ticker: "META", held: [1,1,1,1,1,1,0,0], canSell: false },
+      ];
+      return (
+        <div>
+          <div style={{ fontSize: 11, color: COLORS.textMuted, marginBottom: 10, fontWeight: 600 }}>Output Feasibility Mask — per security:</div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            {securities.map((s) => (
+              <div key={s.ticker} style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                <div style={{ width: 50, fontSize: 12, fontWeight: 700, color: COLORS.text, fontFamily: "'JetBrains Mono', monospace" }}>{s.ticker}</div>
+                <div style={{ display: "flex", gap: 2 }}>
+                  {s.held.map((h, i) => (
+                    <div key={i} style={{
+                      width: 20, height: 20, borderRadius: 3, fontSize: 9,
+                      display: "flex", alignItems: "center", justifyContent: "center",
+                      background: h ? COLORS.purpleBg : "rgba(100,116,139,0.06)",
+                      border: "1px solid " + (h ? "rgba(167,139,250,0.25)" : "rgba(100,116,139,0.1)"),
+                      color: h ? COLORS.purple : COLORS.textDim,
+                    }}>{h ? "✓" : "·"}</div>
+                  ))}
+                </div>
+                <div style={{ fontSize: 11, color: COLORS.textDim }}>→</div>
+                {s.canSell ? (
+                  <div style={{ display: "flex", gap: 3 }}>
+                    <span style={{ padding: "2px 6px", borderRadius: 3, fontSize: 10, background: COLORS.sellBg, color: COLORS.sell }}>SELL</span>
+                    <span style={{ padding: "2px 6px", borderRadius: 3, fontSize: 10, background: COLORS.holdBg, color: COLORS.hold }}>HOLD</span>
+                    <span style={{ padding: "2px 6px", borderRadius: 3, fontSize: 10, background: COLORS.buyBg, color: COLORS.buy }}>BUY</span>
+                  </div>
+                ) : (
+                  <div style={{ display: "flex", gap: 3, alignItems: "center" }}>
+                    <span style={{ padding: "2px 6px", borderRadius: 3, fontSize: 10, background: "rgba(100,116,139,0.06)", color: COLORS.textDim, textDecoration: "line-through" }}>SELL</span>
+                    <span style={{ padding: "2px 6px", borderRadius: 3, fontSize: 10, background: COLORS.holdBg, color: COLORS.hold }}>HOLD</span>
+                    <span style={{ padding: "2px 6px", borderRadius: 3, fontSize: 10, background: COLORS.buyBg, color: COLORS.buy }}>BUY</span>
+                    <span style={{ fontSize: 9, color: COLORS.mask, marginLeft: 4 }}>not continuously held</span>
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+          <div style={{ marginTop: 12, fontSize: 10, color: COLORS.textDim, display: "flex", gap: 20 }}>
+            <span>Q1 · · · · · · · Q8 (8-quarter input horizon)</span>
+          </div>
+        </div>
+      );
+    }
+
+    function OutputVisual() {
+      const preds = [
+        { ticker: "MSFT", sell: 0.05, hold: 0.82, buy: 0.13, pred: "HOLD" },
+        { ticker: "AAPL", sell: 0.68, hold: 0.24, buy: 0.08, pred: "SELL" },
+        { ticker: "NVDA", sell: 0.00, hold: 0.31, buy: 0.69, pred: "BUY" },
+        { ticker: "META", sell: 0.00, hold: 0.55, buy: 0.45, pred: "HOLD" },
+        { ticker: "AMZN", sell: 0.12, hold: 0.76, buy: 0.12, pred: "HOLD" },
+      ];
+      const predColor = { SELL: COLORS.sell, HOLD: COLORS.hold, BUY: COLORS.buy };
+      const predBg = { SELL: COLORS.sellBg, HOLD: COLORS.holdBg, BUY: COLORS.buyBg };
+      return (
+        <div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            {preds.map((p) => (
+              <div key={p.ticker} style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                <div style={{ width: 50, fontSize: 12, fontWeight: 700, color: COLORS.text, fontFamily: "'JetBrains Mono', monospace" }}>{p.ticker}</div>
+                <div style={{ display: "flex", width: 200, height: 18, borderRadius: 4, overflow: "hidden" }}>
+                  <div style={{ width: (p.sell * 100) + "%", background: COLORS.sell, minWidth: p.sell > 0 ? 2 : 0 }} />
+                  <div style={{ width: (p.hold * 100) + "%", background: COLORS.hold }} />
+                  <div style={{ width: (p.buy * 100) + "%", background: COLORS.buy }} />
+                </div>
+                <div style={{ display: "flex", gap: 8, fontSize: 10, fontFamily: "'JetBrains Mono', monospace", color: COLORS.textDim, minWidth: 110 }}>
+                  <span style={{ color: COLORS.sell }}>{p.sell.toFixed(2)}</span>
+                  <span style={{ color: COLORS.hold }}>{p.hold.toFixed(2)}</span>
+                  <span style={{ color: COLORS.buy }}>{p.buy.toFixed(2)}</span>
+                </div>
+                <span style={{
+                  padding: "2px 8px", borderRadius: 4, fontSize: 10, fontWeight: 700,
+                  background: predBg[p.pred], color: predColor[p.pred],
+                }}>{p.pred}</span>
+              </div>
+            ))}
+          </div>
+          <div style={{ marginTop: 12, display: "flex", gap: 14, fontSize: 11 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+              <div style={{ width: 10, height: 10, borderRadius: 2, background: COLORS.sell }} />
+              <span style={{ color: COLORS.textMuted }}>P(sell)</span>
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+              <div style={{ width: 10, height: 10, borderRadius: 2, background: COLORS.hold }} />
+              <span style={{ color: COLORS.textMuted }}>P(hold)</span>
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+              <div style={{ width: 10, height: 10, borderRadius: 2, background: COLORS.buy }} />
+              <span style={{ color: COLORS.textMuted }}>P(buy)</span>
+            </div>
+          </div>
+          <div style={{ marginTop: 8, fontSize: 11, color: COLORS.textDim, fontStyle: "italic" }}>
+            Prediction = argmax per security. Evaluated against actual next-quarter trade direction.
+          </div>
+        </div>
+      );
+    }
+
+    const VISUALS = {
+      raw: RawDataVisual,
+      rank: RankPadVisual,
+      features: FeatureVisual,
+      tensor: TensorVisual,
+      vectorize: VectorizeVisual,
+      lstm: LSTMVisual,
+      masks: MasksVisual,
+      output: OutputVisual,
+    };
+
+    function App() {
+      const [activeStep, setActiveStep] = useState(0);
+      const step = STEPS[activeStep];
+      const Visual = VISUALS[step.visual];
+
+      return (
+        <div style={{
+          minHeight: "100vh", background: COLORS.bg, color: COLORS.text,
+          fontFamily: "'Open Sans', -apple-system, sans-serif",
+          padding: "24px 20px",
+        }}>
+          <div style={{ maxWidth: 800, margin: "0 auto", marginBottom: 28 }}>
+            <div style={{ fontSize: 11, textTransform: "uppercase", letterSpacing: 2, color: COLORS.textDim, marginBottom: 6 }}>
+              Cohen, Lu &amp; Nguyen (2026) &mdash; "Mimicking Finance"
+            </div>
+            <h1 style={{ fontSize: 22, fontWeight: 700, color: COLORS.text, margin: 0, lineHeight: 1.3 }}>
+              LSTM Model Construction Pipeline
+            </h1>
+            <div style={{ fontSize: 13, color: COLORS.textMuted, marginTop: 6 }}>
+              How the paper transforms raw fund holdings into a trade direction prediction system
+            </div>
+          </div>
+
+          <div style={{ maxWidth: 800, margin: "0 auto", display: "flex", flexDirection: "column", gap: 16 }}>
+            <div style={{ display: "flex", gap: 2, overflowX: "auto", paddingBottom: 4, WebkitOverflowScrolling: "touch" }}>
+              {STEPS.map((s, i) => (
+                <button key={s.id} onClick={() => setActiveStep(i)} style={{
+                  padding: "8px 12px", borderRadius: 6, border: "none", cursor: "pointer",
+                  fontSize: 11, fontWeight: activeStep === i ? 700 : 500, whiteSpace: "nowrap",
+                  background: activeStep === i ? COLORS.accent : "transparent",
+                  color: activeStep === i ? "#fff" : COLORS.textDim,
+                  transition: "all 0.15s ease",
+                  fontFamily: "inherit",
+                }}>
+                  {s.label}
+                </button>
+              ))}
+            </div>
+
+            <div style={{
+              background: COLORS.card, borderRadius: 12, padding: "24px 28px",
+              border: "1px solid " + COLORS.border,
+            }}>
+              <div style={{ marginBottom: 16 }}>
+                <div style={{ fontSize: 16, fontWeight: 700, color: COLORS.text }}>{step.label}</div>
+                <div style={{ fontSize: 12, color: COLORS.accent, fontWeight: 600, marginTop: 2 }}>{step.subtitle}</div>
+              </div>
+              <div style={{ fontSize: 13, color: COLORS.textMuted, lineHeight: 1.7, marginBottom: 20 }}>
+                {step.description}
+              </div>
+              <div style={{
+                background: "rgba(0,0,0,0.25)", borderRadius: 8, padding: "20px",
+                border: "1px solid " + COLORS.border,
+              }}>
+                <Visual />
+              </div>
+            </div>
+
+            <div style={{ display: "flex", justifyContent: "space-between" }}>
+              <button onClick={() => setActiveStep(Math.max(0, activeStep - 1))}
+                disabled={activeStep === 0}
+                style={{
+                  padding: "8px 16px", borderRadius: 6, border: "1px solid " + COLORS.border,
+                  background: "transparent", color: activeStep === 0 ? COLORS.textDim : COLORS.text,
+                  cursor: activeStep === 0 ? "default" : "pointer", fontSize: 12, fontFamily: "inherit",
+                  opacity: activeStep === 0 ? 0.3 : 1,
+                }}>
+                ← Previous
+              </button>
+              <div style={{ fontSize: 11, color: COLORS.textDim, alignSelf: "center" }}>
+                {activeStep + 1} / {STEPS.length}
+              </div>
+              <button onClick={() => setActiveStep(Math.min(STEPS.length - 1, activeStep + 1))}
+                disabled={activeStep === STEPS.length - 1}
+                style={{
+                  padding: "8px 16px", borderRadius: 6, border: "1px solid " + COLORS.border,
+                  background: activeStep === STEPS.length - 1 ? "transparent" : COLORS.accent,
+                  color: activeStep === STEPS.length - 1 ? COLORS.textDim : "#fff",
+                  cursor: activeStep === STEPS.length - 1 ? "default" : "pointer",
+                  fontSize: 12, fontFamily: "inherit",
+                  opacity: activeStep === STEPS.length - 1 ? 0.3 : 1,
+                }}>
+                Next →
+              </button>
+            </div>
+
+            <div style={{
+              background: COLORS.card, borderRadius: 12, padding: "20px 24px",
+              border: "1px solid " + COLORS.border, marginTop: 4,
+            }}>
+              <div style={{ fontSize: 13, fontWeight: 700, color: COLORS.text, marginBottom: 12 }}>
+                Rolling Window Design (per fund)
+              </div>
+              <svg viewBox="0 0 500 100" style={{ width: "100%", maxWidth: 500 }}>
+                {[0, 1, 2].map((obs) => {
+                  const y = obs * 32;
+                  return (
+                    <g key={obs}>
+                      <text x="0" y={y + 16} fill={COLORS.textDim} fontSize="9">Obs {obs + 1}</text>
+                      <rect x={50 + obs * 18} y={y + 2} width="180" height="20" rx="3"
+                        fill={COLORS.purpleBg} stroke="rgba(167,139,250,0.25)" strokeWidth="1" />
+                      <text x={50 + obs * 18 + 90} y={y + 16} fill={COLORS.purple}
+                        fontSize="9" textAnchor="middle" fontWeight="600">20Q train</text>
+                      <rect x={230 + obs * 18} y={y + 2} width="72" height="20" rx="3"
+                        fill={COLORS.cyanBg} stroke="rgba(34,211,238,0.25)" strokeWidth="1" />
+                      <text x={230 + obs * 18 + 36} y={y + 16} fill={COLORS.cyan}
+                        fontSize="9" textAnchor="middle" fontWeight="600">8Q test</text>
+                    </g>
+                  );
+                })}
+                <text x="400" y="16" fill={COLORS.textMuted} fontSize="9">↓ advance 1Q</text>
+                <text x="400" y="48" fill={COLORS.textMuted} fontSize="9">↓ advance 1Q</text>
+              </svg>
+              <div style={{ fontSize: 11, color: COLORS.textDim, marginTop: 8 }}>
+                28-quarter windows, no random shuffling — always chronologically out-of-sample.
+                Fund must have ≥ 7 years history and ≥ 10 securities per quarter.
+              </div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(React.createElement(App));
+  </script>
+</body>
+</html>
